@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>CLM Tag Builder</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; background: #f9fafb; font-size: 13px; }
+  code { font-family: 'Consolas', monospace; }
+  ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const TAG_TYPES = [
+  { value: "Conditional",         label: "Conditional" },
+  { value: "SuppressTableRow",    label: "SuppressTableRow" },
+  { value: "SuppressTableColumn", label: "SuppressTableColumn" },
+];
+const CONDITION_OPS = [
+  { value: "=",            label: "equals" },
+  { value: "!=",           label: "not equals" },
+  { value: "contains",     label: "contains" },
+  { value: "not-contains", label: "does not contain" },
+  { value: "exists",       label: "has a value" },
+  { value: "not-exists",   label: "has no value" },
+];
+const noVal  = c => c === "exists" || c === "not-exists";
+const mkRow  = (logic = null) => ({ id: Math.random().toString(36).slice(2), logic, xpath: "", condition: "=", testValue: "" });
+const INIT   = () => [mkRow(null)];
+
+// ── XPath / tag builders ─────────────────────────────────────────────────────
+function fieldToXPath(raw) {
+  const c = raw.trim();
+  if (!c) return "";
+  if (c.startsWith("//") || c.startsWith("./") || c.startsWith("/")) return c;
+  return "//" + c.replace(/\s+(.)/g, (_, x) => x.toUpperCase()).replace(/^(.)/, x => x.toUpperCase());
+}
+
+function buildXPath(rows) {
+  let expr = "";
+  rows.forEach((r, i) => {
+    const x = r.xpath.trim(); if (!x) return;
+    let p;
+    switch (r.condition) {
+      case "=":            p = `${x}[text()='${r.testValue}']`; break;
+      case "!=":           p = `not(${x}[text()='${r.testValue}'])`; break;
+      case "contains":     p = `contains(${x}, '${r.testValue}')`; break;
+      case "not-contains": p = `not(contains(${x}, '${r.testValue}'))`; break;
+      case "exists":       p = x; break;
+      case "not-exists":   p = `not(${x})`; break;
+      default:             return;
+    }
+    if (i === 0 || !expr) { expr = p; return; }
+    expr = (r.logic || "AND") === "AND" ? `${expr} and ${p}` : `${expr} or ${p}`;
+  });
+  return expr;
+}
+
+function buildTags(tagType, rows) {
+  const expr = buildXPath(rows);
+  if (!expr) return null;
+  if (tagType === "SuppressTableRow")
+    return { open: `<# <SuppressTableRow Test="${expr}" /> #>`, close: "" };
+  if (tagType === "SuppressTableColumn")
+    return { open: `<# <SuppressTableColumn Test="${expr}" /> #>`, close: "" };
+  return {
+    open:  `<# <Conditional Test="${expr}" /> #>`,
+    close: `<# <EndConditional/> #>`,
+  };
+}
+
+// ── Text parser ──────────────────────────────────────────────────────────────
+function parseConditionText(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const rows = [];
+  const condMap = {
+    "does not contain":"not-contains","not contains":"not-contains","contains":"contains",
+    "does not equal":"!=","not equals":"!=","!=":"!=","equals":"=","=":"=",
+    "has no value":"not-exists","has a value":"exists","is not empty":"exists","is empty":"not-exists",
+  };
+  const condPat   = new RegExp(`(does not contain|not contains|contains|does not equal|not equals|!=|equals|=|has no value|has a value|is not empty|is empty)`, "i");
+  const logicPat  = /^(AND|OR)\s+/i;
+  const bulletPat = /^[\*\-•]\s*/;
+  let curField = null, curCond = null, curLogic = null;
+  for (let line of lines) {
+    line = line.replace(bulletPat, "").trim();
+    let rowLogic = curLogic;
+    const lm = line.match(logicPat);
+    if (lm) { rowLogic = lm[1].toUpperCase(); line = line.slice(lm[0].length).trim(); }
+    const cm = line.match(condPat);
+    if (cm) {
+      const ci = line.toLowerCase().indexOf(cm[1].toLowerCase());
+      const fp = line.slice(0, ci).trim(), vp = line.slice(ci + cm[1].length).trim();
+      curField = fp || curField;
+      curCond  = condMap[cm[1].toLowerCase()];
+      const nv = noVal(curCond);
+      if (vp) {
+        rows.push({ id: Math.random().toString(36).slice(2), logic: rows.length === 0 ? null : (rowLogic || "AND"),
+          xpath: fieldToXPath(curField), condition: curCond, testValue: nv ? "" : vp.replace(bulletPat, "").trim() });
+        curLogic = null;
+      } else { curLogic = rowLogic; }
+    } else if (curCond && curField) {
+      const nv = noVal(curCond);
+      rows.push({ id: Math.random().toString(36).slice(2), logic: rows.length === 0 ? null : (rowLogic || curLogic || "AND"),
+        xpath: fieldToXPath(curField), condition: curCond, testValue: nv ? "" : line.replace(bulletPat, "").trim() });
+      curLogic = null;
+    }
+  }
+  return rows.length ? rows : null;
+}
+
+// ── Word API ─────────────────────────────────────────────────────────────────
+async function insertTagAroundSelection(openTag, closeTag) {
+  return Word.run(async ctx => {
+    const sel = ctx.document.getSelection();
+    sel.load("text");
+    await ctx.sync();
+
+    const selectedText = sel.text;
+    if (!selectedText.trim()) throw new Error("No text selected in the document.");
+
+    // Insert close tag after selection (insert after first to preserve range)
+    if (closeTag) {
+      const afterRange = sel.getRange("End");
+      afterRange.insertText(closeTag, "After");
+    }
+    // Insert open tag before selection
+    const beforeRange = sel.getRange("Start");
+    beforeRange.insertText(openTag, "Before");
+
+    await ctx.sync();
+  });
+}
+
+// ── UI primitives ────────────────────────────────────────────────────────────
+const s = {
+  card: { background:"#fff", border:"1px solid #e5e7eb", borderRadius:8, padding:"14px 16px", marginBottom:14 },
+  label: { display:"block", fontSize:11, fontWeight:700, color:"#6b7280", textTransform:"uppercase", letterSpacing:0.5, marginBottom:4 },
+  input: { width:"100%", padding:"6px 8px", fontSize:12, borderRadius:5, border:"1px solid #d1d5db", background:"#fff", color:"#111827", boxSizing:"border-box" },
+  select: { width:"100%", padding:"6px 8px", fontSize:12, borderRadius:5, border:"1px solid #d1d5db", background:"#fff", color:"#111827" },
+  sectionTitle: { fontSize:11, fontWeight:700, color:"#6366f1", textTransform:"uppercase", letterSpacing:1, marginBottom:12 },
+};
+
+function SelInput({ value, onChange, options }) {
+  return <select value={value} onChange={e => onChange(e.target.value)} style={s.select}>
+    {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+  </select>;
+}
+function TxtInput({ value, onChange, placeholder, mono, disabled }) {
+  return <input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} disabled={disabled}
+    style={{ ...s.input, fontFamily: mono ? "Consolas,monospace" : "inherit", background: disabled ? "#f3f4f6" : "#fff", color: disabled ? "#9ca3af" : "#111827" }} />;
+}
+function PrimaryBtn({ onClick, disabled, children, color = "#6366f1" }) {
+  return <button onClick={onClick} disabled={disabled}
+    style={{ padding:"8px 16px", fontSize:12, fontWeight:700, borderRadius:6, border:"none",
+      background: disabled ? "#e5e7eb" : color, color: disabled ? "#9ca3af" : "#fff", cursor: disabled ? "not-allowed" : "pointer", width:"100%" }}>
+    {children}
+  </button>;
+}
+function OutlineBtn({ onClick, children, color = "#6366f1" }) {
+  return <button onClick={onClick}
+    style={{ padding:"5px 12px", fontSize:12, fontWeight:600, borderRadius:5, border:`1px solid ${color}`, background:"#fff", color, cursor:"pointer" }}>
+    {children}
+  </button>;
+}
+
+// ── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [ready,      setReady]      = useState(false);
+  const [tagType,    setTagType]    = useState("Conditional");
+  const [rows,       setRows]       = useState(INIT());
+  const [mode,       setMode]       = useState("table");
+  const [parseText,  setParseText]  = useState("");
+  const [parseError, setParseError] = useState("");
+  const [status,     setStatus]     = useState({ msg: "", type: "idle" }); // idle | success | error | loading
+  const [copied,     setCopied]     = useState(false);
+
+  useEffect(() => {
+    Office.onReady(info => {
+      if (info.host === Office.HostType.Word) setReady(true);
+    });
+  }, []);
+
+  // ── Reset ──
+  const handleReset = () => {
+    setTagType("Conditional"); setRows(INIT()); setMode("table");
+    setParseText(""); setParseError(""); setStatus({ msg: "", type: "idle" });
+  };
+
+  // ── Row ops ──
+  const updateRow = (id, f, v) => setRows(rows.map(r => r.id === id ? { ...r, [f]: v } : r));
+  const addRow    = logic => setRows([...rows, mkRow(logic)]);
+  const removeRow = id => {
+    if (rows.length === 1) return;
+    const idx = rows.findIndex(r => r.id === id);
+    const next = rows.filter(r => r.id !== id);
+    if (idx === 0 && next.length) next[0] = { ...next[0], logic: null };
+    setRows(next);
+  };
+
+  const handleParse = () => {
+    setParseError("");
+    const parsed = parseConditionText(parseText);
+    if (!parsed) { setParseError("Could not parse conditions. Check format and retry."); return; }
+    setRows(parsed); setMode("table");
+  };
+
+  // ── Insert ──
+  const handleInsert = async () => {
+    const tags = buildTags(tagType, rows);
+    if (!tags) { setStatus({ msg: "Complete the condition rules first.", type: "error" }); return; }
+    setStatus({ msg: "Inserting…", type: "loading" });
+    try {
+      await insertTagAroundSelection(tags.open, tags.close);
+      setStatus({ msg: "✅ Tag inserted successfully.", type: "success" });
+    } catch (e) {
+      setStatus({ msg: `❌ ${e.message}`, type: "error" });
+    }
+  };
+
+  const xpathExpr  = buildXPath(rows);
+  const tags       = buildTags(tagType, rows);
+  const previewStr = tags ? (tags.close ? `${tags.open}[selected text]${tags.close}` : `${tags.open}`) : "";
+
+  const colW = ["70px", "1fr", "110px", "1fr", "22px"];
+
+  const tabBtn = (m, label) =>
+    <button onClick={() => setMode(m)} style={{ padding:"5px 14px", fontSize:12, fontWeight:600, borderRadius:5, border:"none", cursor:"pointer",
+      background: mode === m ? "#6366f1" : "#f3f4f6", color: mode === m ? "#fff" : "#6b7280" }}>{label}</button>;
+
+  if (!ready) return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", height:"100vh", color:"#6b7280", flexDirection:"column", gap:12 }}>
+      <div style={{ fontSize:24 }}>⏳</div>
+      <div style={{ fontSize:13 }}>Initialising Office Add-in…</div>
+    </div>
+  );
+
+  return (
+    <div style={{ padding:"12px 14px", minHeight:"100vh", background:"#f9fafb" }}>
+
+      {/* Header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <div>
+          <div style={{ fontSize:16, fontWeight:700, color:"#111827" }}>CLM Tag Builder</div>
+          <div style={{ fontSize:11, color:"#9ca3af" }}>Docusign CLM · Conditional Tags</div>
+        </div>
+        <button onClick={handleReset}
+          style={{ padding:"5px 12px", fontSize:11, fontWeight:600, borderRadius:5, border:"1px solid #e5e7eb", background:"#fff", color:"#6b7280", cursor:"pointer" }}>
+          🔄 Reset
+        </button>
+      </div>
+
+      {/* 1. Tag Type */}
+      <div style={s.card}>
+        <div style={s.sectionTitle}>1. Tag Type</div>
+        <SelInput value={tagType} onChange={setTagType} options={TAG_TYPES} />
+      </div>
+
+      {/* 2. Conditions */}
+      <div style={s.card}>
+        <div style={s.sectionTitle}>2. Condition Rules</div>
+        <div style={{ display:"flex", gap:6, marginBottom:12 }}>
+          {tabBtn("table", "✏️ Manual")}
+          {tabBtn("parse", "📋 Paste")}
+        </div>
+
+        {mode === "parse" && (
+          <div>
+            <div style={{ fontSize:11, color:"#6b7280", marginBottom:6, lineHeight:1.5 }}>
+              Paste condition text. Detected: <code>Field contains Value</code>, <code>AND/OR …</code>, bullet values.
+            </div>
+            <textarea value={parseText} onChange={e => setParseText(e.target.value)} rows={6}
+              placeholder={"Field contains:\n* Value A\nAND Field does not contain\n* Value B"}
+              style={{ ...s.input, fontFamily:"Consolas,monospace", resize:"vertical", lineHeight:1.5, height:"auto" }} />
+            {parseError && <div style={{ color:"#dc2626", fontSize:11, marginTop:4 }}>{parseError}</div>}
+            <button onClick={handleParse}
+              style={{ marginTop:8, padding:"6px 14px", fontSize:12, fontWeight:600, borderRadius:5, border:"none", background:"#6366f1", color:"#fff", cursor:"pointer" }}>
+              Parse → Populate
+            </button>
+          </div>
+        )}
+
+        {mode === "table" && (
+          <>
+            {/* column headers */}
+            <div style={{ display:"grid", gridTemplateColumns:colW.join(" "), gap:4, marginBottom:4 }}>
+              {["Logic","XPath","Condition","Value",""].map((h,i) => (
+                <div key={i} style={{ fontSize:10, fontWeight:700, color:"#9ca3af", textTransform:"uppercase" }}>{h}</div>
+              ))}
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+              {rows.map((row, idx) => (
+                <div key={row.id} style={{ display:"grid", gridTemplateColumns:colW.join(" "), gap:4, alignItems:"center" }}>
+                  <div style={{ display:"flex", justifyContent:"center" }}>
+                    {idx === 0
+                      ? <span style={{ fontSize:10, color:"#d1d5db" }}>—</span>
+                      : <div style={{ display:"flex", borderRadius:4, overflow:"hidden", border:"1px solid #e5e7eb" }}>
+                          {["AND","OR"].map(l => (
+                            <button key={l} onClick={() => updateRow(row.id,"logic",l)}
+                              style={{ padding:"3px 6px", fontSize:10, fontWeight:700, border:"none", cursor:"pointer",
+                                background: row.logic===l ? (l==="AND"?"#6366f1":"#f59e0b") : "#fff",
+                                color: row.logic===l ? "#fff" : "#9ca3af" }}>{l}</button>
+                          ))}
+                        </div>
+                    }
+                  </div>
+                  <TxtInput value={row.xpath}     onChange={v => updateRow(row.id,"xpath",v)}     placeholder="//Field" mono />
+                  <SelInput value={row.condition} onChange={v => updateRow(row.id,"condition",v)} options={CONDITION_OPS} />
+                  <TxtInput value={row.testValue} onChange={v => updateRow(row.id,"testValue",v)}
+                    placeholder={noVal(row.condition) ? "—" : "value"} disabled={noVal(row.condition)} />
+                  <button onClick={() => removeRow(row.id)}
+                    style={{ background:"none", border:"none", cursor: rows.length===1?"not-allowed":"pointer",
+                      color: rows.length===1?"#e5e7eb":"#ef4444", fontSize:16, padding:0, lineHeight:1 }}>×</button>
+                </div>
+              ))}
+            </div>
+            <div style={{ display:"flex", gap:6, marginTop:10 }}>
+              <span style={{ fontSize:11, color:"#9ca3af", alignSelf:"center" }}>Add:</span>
+              <OutlineBtn onClick={() => addRow("AND")}>+ AND</OutlineBtn>
+              <OutlineBtn onClick={() => addRow("OR")} color="#f59e0b">+ OR</OutlineBtn>
+            </div>
+            {xpathExpr && (
+              <div style={{ marginTop:10, padding:"8px 10px", background:"#f1f5f9", borderRadius:5, fontSize:11, color:"#475569", wordBreak:"break-all" }}>
+                <strong>XPath:</strong> <code>{xpathExpr}</code>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* 3. Tag Preview */}
+      {previewStr && (
+        <div style={s.card}>
+          <div style={s.sectionTitle}>3. Tag Preview</div>
+          <pre style={{ fontFamily:"Consolas,monospace", fontSize:11, color:"#1e293b", whiteSpace:"pre-wrap", wordBreak:"break-all",
+            margin:0, background:"#f8fafc", border:"1px solid #e2e8f0", borderRadius:5, padding:"8px 10px", lineHeight:1.6 }}>
+            {previewStr}
+          </pre>
+          <button onClick={() => { navigator.clipboard.writeText(previewStr); setCopied(true); setTimeout(()=>setCopied(false),1800); }}
+            style={{ marginTop:8, padding:"4px 12px", fontSize:11, borderRadius:4, border:"1px solid #d1d5db",
+              background: copied?"#dcfce7":"#f9fafb", color: copied?"#16a34a":"#374151", cursor:"pointer" }}>
+            {copied ? "Copied!" : "Copy tag"}
+          </button>
+        </div>
+      )}
+
+      {/* 4. Insert */}
+      <div style={s.card}>
+        <div style={s.sectionTitle}>4. Insert into Document</div>
+        <div style={{ fontSize:11, color:"#6b7280", marginBottom:10, lineHeight:1.5 }}>
+          Select text in your Word document, then click <strong>Insert Tag</strong>. The selected text will be wrapped with the conditional tag — formatting is preserved.
+        </div>
+        <PrimaryBtn onClick={handleInsert} disabled={!tags}>
+          ⬇ Insert Tag Around Selection
+        </PrimaryBtn>
+        {status.msg && (
+          <div style={{ marginTop:8, fontSize:12, lineHeight:1.5,
+            color: status.type==="success"?"#16a34a":status.type==="error"?"#dc2626":"#6b7280" }}>
+            {status.msg}
+          </div>
+        )}
+      </div>
+
+    </div>
+  );
+}
+
+Office.onReady(() => {
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+});
+</script>
+</body>
+</html>
